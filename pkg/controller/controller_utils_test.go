@@ -914,6 +914,120 @@ func TestSortingActivePodsWithRanks(t *testing.T) {
 	}
 }
 
+func TestConsolidatingScaleDown(t *testing.T) {
+	now := metav1.Now()
+	then1Month := metav1.Time{Time: now.AddDate(0, -1, 0)}
+
+	// Helper to create a pod with specific properties. All pods are Running+Ready
+	// on the same node by default so they are equal on steps 1-4, isolating the
+	// consolidation-specific steps (4.5 and 5).
+	pod := func(name, nodeName string, readySince, created metav1.Time, restarts int32) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				CreationTimestamp: created,
+				Name:              name,
+			},
+			Spec: v1.PodSpec{
+				NodeName: nodeName,
+			},
+			Status: v1.PodStatus{
+				Phase: v1.PodRunning,
+				Conditions: []v1.PodCondition{
+					{Type: v1.PodReady, Status: v1.ConditionTrue, LastTransitionTime: readySince},
+				},
+				ContainerStatuses: []v1.ContainerStatus{{RestartCount: restarts}},
+			},
+		}
+	}
+
+	// Two pods equal on steps 1-4, same ready-time, same restarts, same creation time.
+	podA := pod("pod-a", "node-a", then1Month, then1Month, 0)
+	podB := pod("pod-b", "node-b", then1Month, then1Month, 0)
+
+	t.Run("Step4.5_GateOn_DoNotDisrupt_deprioritizes_annotated_node", func(t *testing.T) {
+		// Requirements: 7.3 — do-not-disrupt deprioritizes deletion of pods on annotated nodes
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, true)
+
+		podsWithRanks := ActivePodsWithRanks{
+			Pods:         []*v1.Pod{podA, podB},
+			Rank:         []int{5, 5}, // equal rank so step 5 won't decide
+			Now:          now,
+			DoNotDisrupt: []bool{false, true}, // podA NOT on do-not-disrupt, podB IS
+		}
+		// podA (not on do-not-disrupt node) should be preferred for deletion
+		if !podsWithRanks.Less(0, 1) {
+			t.Errorf("expected pod on non-do-not-disrupt node (pod-a) to be preferred for deletion over pod on do-not-disrupt node (pod-b)")
+		}
+		if podsWithRanks.Less(1, 0) {
+			t.Errorf("expected pod on do-not-disrupt node (pod-b) NOT to be preferred for deletion over pod on non-do-not-disrupt node (pod-a)")
+		}
+	})
+
+	t.Run("Step5_GateOn_LowerRank_preferred_for_deletion", func(t *testing.T) {
+		// Requirements: 7.2 — consolidation heuristic orders by disruption cost (lower rank = fewer pods = prefer deletion)
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, true)
+
+		podsWithRanks := ActivePodsWithRanks{
+			Pods:         []*v1.Pod{podA, podB},
+			Rank:         []int{3, 10}, // podA on node with 3 pods, podB on node with 10 pods
+			Now:          now,
+			DoNotDisrupt: []bool{false, false}, // equal do-not-disrupt so step 4.5 falls through
+		}
+		// podA (lower rank = fewer pods on node) should be preferred for deletion
+		if !podsWithRanks.Less(0, 1) {
+			t.Errorf("expected pod with lower rank (pod-a, rank 3) to be preferred for deletion over pod with higher rank (pod-b, rank 10)")
+		}
+		if podsWithRanks.Less(1, 0) {
+			t.Errorf("expected pod with higher rank (pod-b, rank 10) NOT to be preferred for deletion over pod with lower rank (pod-a, rank 3)")
+		}
+	})
+
+	t.Run("EqualDoNotDisrupt_EqualRank_FallThrough_to_later_criteria", func(t *testing.T) {
+		// Requirements: 7.2, 7.3 — equal do-not-disrupt and equal rank fall through to remaining criteria
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, true)
+
+		// podC is ready more recently (now) → should be preferred for deletion (step 6: newer ready = delete first)
+		// podD has been ready longer (then1Month) → should be kept
+		podC := pod("pod-c", "node-c", now, then1Month, 0)
+		podD := pod("pod-d", "node-d", then1Month, then1Month, 0)
+
+		podsWithRanks := ActivePodsWithRanks{
+			Pods:         []*v1.Pod{podC, podD},
+			Rank:         []int{5, 5}, // equal rank
+			Now:          now,
+			DoNotDisrupt: []bool{false, false}, // equal do-not-disrupt
+		}
+		// podC (ready more recently) should be preferred for deletion via step 6
+		if !podsWithRanks.Less(0, 1) {
+			t.Errorf("expected pod ready more recently (pod-c) to be preferred for deletion when do-not-disrupt and rank are equal")
+		}
+		if podsWithRanks.Less(1, 0) {
+			t.Errorf("expected pod ready longer (pod-d) NOT to be preferred for deletion when do-not-disrupt and rank are equal")
+		}
+	})
+
+	t.Run("GateOff_Step4.5_skipped_Step5_uses_spreading", func(t *testing.T) {
+		// Requirements: 7.4 — gate off: step 4.5 is skipped and step 5 uses spreading direction
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, false)
+
+		// With gate off, DoNotDisrupt should be ignored even if populated,
+		// and step 5 should use spreading direction: higher rank = prefer deletion.
+		podsWithRanks := ActivePodsWithRanks{
+			Pods:         []*v1.Pod{podA, podB},
+			Rank:         []int{3, 10},
+			Now:          now,
+			DoNotDisrupt: []bool{true, false}, // podA on do-not-disrupt, podB not — should be ignored
+		}
+		// With spreading (gate off): higher rank = prefer deletion → podB (rank 10) preferred
+		if podsWithRanks.Less(0, 1) {
+			t.Errorf("expected pod with lower rank (pod-a, rank 3) NOT to be preferred for deletion with gate off (spreading: higher rank preferred)")
+		}
+		if !podsWithRanks.Less(1, 0) {
+			t.Errorf("expected pod with higher rank (pod-b, rank 10) to be preferred for deletion with gate off (spreading: higher rank preferred)")
+		}
+	})
+}
+
 func TestNextPodAvailabilityCheck(t *testing.T) {
 	newPodWithReadyCond := func(now metav1.Time, ready bool, beforeSec int) *v1.Pod {
 		conditionStatus := v1.ConditionFalse

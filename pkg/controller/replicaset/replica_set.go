@@ -128,6 +128,12 @@ type ReplicaSetController struct {
 	// Added as a member to the struct to allow injection for testing.
 	podListerSynced cache.InformerSynced
 
+	// nodeLister is optionally initialized when ConsolidatingScaleDown is enabled.
+	// Used for future resource-based scoring and node existence validation.
+	nodeLister corelisters.NodeLister
+	// nodeListerSynced returns true if the node store has been synced at least once.
+	nodeListerSynced cache.InformerSynced
+
 	// Controllers that need to be synced
 	queue workqueue.TypedRateLimitingInterface[string]
 
@@ -152,7 +158,7 @@ func DefaultReplicaSetControllerFeatures() ReplicaSetControllerFeatures {
 }
 
 // NewReplicaSetController configures a replica set controller with the specified event recorder
-func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, kubeClient clientset.Interface, burstReplicas int) *ReplicaSetController {
+func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, nodeInformer coreinformers.NodeInformer, kubeClient clientset.Interface, burstReplicas int) *ReplicaSetController {
 	logger := klog.FromContext(ctx)
 	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	if err := metrics.Register(legacyregistry.Register); err != nil {
@@ -184,7 +190,7 @@ func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.Repli
 		consistencyStore = consistencyutil.NewNoopConsistencyStore()
 	}
 
-	return NewBaseController(logger, rsInformer, podInformer, kubeClient, burstReplicas,
+	return NewBaseController(logger, rsInformer, podInformer, nodeInformer, kubeClient, burstReplicas,
 		apps.SchemeGroupVersion.WithKind("ReplicaSet"),
 		"replicaset_controller",
 		"replicaset",
@@ -201,7 +207,7 @@ func NewReplicaSetController(ctx context.Context, rsInformer appsinformers.Repli
 
 // NewBaseController is the implementation of NewReplicaSetController with additional injected
 // parameters so that it can also serve as the implementation of NewReplicationController.
-func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, kubeClient clientset.Interface, burstReplicas int,
+func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetInformer, podInformer coreinformers.PodInformer, nodeInformer coreinformers.NodeInformer, kubeClient clientset.Interface, burstReplicas int,
 	gvk schema.GroupVersionKind, metricOwnerName, queueName string, podControl controller.PodControlInterface, eventBroadcaster record.EventBroadcaster, controllerFeatures ReplicaSetControllerFeatures, consistencyStore consistencyutil.ConsistencyStore) *ReplicaSetController {
 
 	rsc := &ReplicaSetController{
@@ -266,6 +272,15 @@ func NewBaseController(logger klog.Logger, rsInformer appsinformers.ReplicaSetIn
 	rsc.podListerSynced = podInformer.Informer().HasSynced
 	controller.AddPodControllerIndexer(podInformer.Informer()) //nolint:errcheck
 	rsc.podIndexer = podInformer.Informer().GetIndexer()
+
+	// Conditionally initialize node informer when ConsolidatingScaleDown is enabled.
+	if nodeInformer != nil {
+		rsc.nodeLister = nodeInformer.Lister()
+		rsc.nodeListerSynced = nodeInformer.Informer().HasSynced
+	} else {
+		rsc.nodeListerSynced = func() bool { return true }
+	}
+
 	rsc.syncHandler = rsc.syncReplicaSet
 
 	return rsc
@@ -291,7 +306,7 @@ func (rsc *ReplicaSetController) Run(ctx context.Context, workers int) {
 		wg.Wait()
 	}()
 
-	if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced) {
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, rsc.podListerSynced, rsc.rsListerSynced, rsc.nodeListerSynced) {
 		return
 	}
 
@@ -707,7 +722,7 @@ func (rsc *ReplicaSetController) manageReplicas(ctx context.Context, activePods 
 		utilruntime.HandleError(err)
 
 		// Choose which Pods to delete, preferring those in earlier phases of startup.
-		podsToDelete := getPodsToDelete(activePods, relatedPods, diff)
+		podsToDelete := rsc.getPodsToDelete(activePods, relatedPods, diff)
 
 		// Snapshot the UIDs (ns/name) of the pods we're expecting to see
 		// deleted, so we know to record their expectations exactly once either
@@ -938,15 +953,75 @@ func (rsc *ReplicaSetController) getIndirectlyRelatedPods(logger klog.Logger, rs
 	return relatedPods, nil
 }
 
-func getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
+func (rsc *ReplicaSetController) getPodsToDelete(filteredPods, relatedPods []*v1.Pod, diff int) []*v1.Pod {
 	// No need to sort pods if we are about to delete all of them.
 	// diff will always be <= len(filteredPods), so not need to handle > case.
 	if diff < len(filteredPods) {
-		podsWithRanks := getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+		var podsWithRanks controller.ActivePodsWithRanks
+		if utilfeature.DefaultFeatureGate.Enabled(features.ConsolidatingScaleDown) &&
+			rsc.nodeListerSynced() {
+			podsWithRanks = rsc.getPodsRankedByNodeDisruptionCost(filteredPods)
+		} else {
+			podsWithRanks = getPodsRankedByRelatedPodsOnSameNode(filteredPods, relatedPods)
+		}
 		sort.Sort(podsWithRanks)
 		reportSortingDeletionAgeRatioMetric(filteredPods, diff)
 	}
 	return filteredPods[:diff]
+}
+
+// getPodsRankedByNodeDisruptionCost computes a disruption cost rank for each
+// candidate pod based on the total number of active pods on the pod's node.
+// Pods on nodes with fewer total pods receive lower ranks (higher deletion
+// priority under the consolidation heuristic). It also checks whether any
+// active pod on each node carries the karpenter.sh/do-not-disrupt: "true"
+// annotation, populating the DoNotDisrupt flag accordingly.
+func (rsc *ReplicaSetController) getPodsRankedByNodeDisruptionCost(
+	podsToRank []*v1.Pod,
+) controller.ActivePodsWithRanks {
+	// Count all active pods per node using PodNodeNameKeyIndex
+	nodePodCounts := make(map[string]int)
+	nodeHasDoNotDisrupt := make(map[string]bool)
+
+	for _, pod := range podsToRank {
+		nodeName := pod.Spec.NodeName
+		if nodeName == "" {
+			continue
+		}
+		if _, computed := nodePodCounts[nodeName]; !computed {
+			// Look up ALL pods on this node via the indexer
+			objs, err := rsc.podIndexer.ByIndex(controller.PodNodeNameKeyIndex, nodeName)
+			if err != nil {
+				nodePodCounts[nodeName] = 0
+				continue
+			}
+			count := 0
+			for _, obj := range objs {
+				p := obj.(*v1.Pod)
+				if controller.IsPodActive(p) {
+					count++
+					if p.Annotations["karpenter.sh/do-not-disrupt"] == "true" {
+						nodeHasDoNotDisrupt[nodeName] = true
+					}
+				}
+			}
+			nodePodCounts[nodeName] = count
+		}
+	}
+
+	ranks := make([]int, len(podsToRank))
+	doNotDisrupt := make([]bool, len(podsToRank))
+	for i, pod := range podsToRank {
+		ranks[i] = nodePodCounts[pod.Spec.NodeName] // 0 if empty node name
+		doNotDisrupt[i] = nodeHasDoNotDisrupt[pod.Spec.NodeName]
+	}
+
+	return controller.ActivePodsWithRanks{
+		Pods:         podsToRank,
+		Rank:         ranks,
+		Now:          metav1.Now(),
+		DoNotDisrupt: doNotDisrupt,
+	}
 }
 
 func reportSortingDeletionAgeRatioMetric(filteredPods []*v1.Pod, diff int) {

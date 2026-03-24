@@ -827,6 +827,11 @@ type ActivePodsWithRanks struct {
 	// Now is a reference timestamp for doing logarithmic timestamp comparisons.
 	// If zero, comparison happens without scaling.
 	Now metav1.Time
+
+	// DoNotDisrupt indicates whether each pod resides on a node with at least
+	// one pod carrying the karpenter.sh/do-not-disrupt: "true" annotation.
+	// Only populated when ConsolidatingScaleDown is enabled.
+	DoNotDisrupt []bool
 }
 
 func (s ActivePodsWithRanks) Len() int {
@@ -836,6 +841,9 @@ func (s ActivePodsWithRanks) Len() int {
 func (s ActivePodsWithRanks) Swap(i, j int) {
 	s.Pods[i], s.Pods[j] = s.Pods[j], s.Pods[i]
 	s.Rank[i], s.Rank[j] = s.Rank[j], s.Rank[i]
+	if len(s.DoNotDisrupt) == len(s.Pods) {
+		s.DoNotDisrupt[i], s.DoNotDisrupt[j] = s.DoNotDisrupt[j], s.DoNotDisrupt[i]
+	}
 }
 
 // Less compares two pods with corresponding ranks and returns true if the first
@@ -865,11 +873,22 @@ func (s ActivePodsWithRanks) Less(i, j int) bool {
 		}
 	}
 
-	// 5. Doubled up < not doubled up
-	// If one of the two pods is on the same node as one or more additional
-	// ready pods that belong to the same replicaset, whichever pod has more
-	// colocated ready pods is less
+	// 4.5 (ConsolidatingScaleDown only): Pods on do-not-disrupt nodes are deprioritized
+	if utilfeature.DefaultFeatureGate.Enabled(features.ConsolidatingScaleDown) &&
+		len(s.DoNotDisrupt) == len(s.Pods) {
+		if s.DoNotDisrupt[i] != s.DoNotDisrupt[j] {
+			// Prefer deleting the pod NOT on a do-not-disrupt node
+			return !s.DoNotDisrupt[i]
+		}
+	}
+
+	// 5. Topology rank
 	if s.Rank[i] != s.Rank[j] {
+		if utilfeature.DefaultFeatureGate.Enabled(features.ConsolidatingScaleDown) {
+			// Lower rank = fewer pods on node = prefer deletion (consolidation)
+			return s.Rank[i] < s.Rank[j]
+		}
+		// Higher rank = more colocated pods = prefer deletion (spreading)
 		return s.Rank[i] > s.Rank[j]
 	}
 	// TODO: take availability into account when we push minReadySeconds information from deployment into pods,

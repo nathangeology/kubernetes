@@ -164,6 +164,14 @@ const (
 	// Enables container Checkpoint support in the kubelet
 	ContainerCheckpoint featuregate.Feature = "ContainerCheckpoint"
 
+	// owner: @<author>
+	// kep: https://kep.k8s.io/NNNN
+	//
+	// Enables consolidation-aware pod deletion ranking during ReplicaSet scale-down.
+	// When enabled, pods on nodes with fewer total pods (lower disruption cost) are
+	// preferred for deletion, and karpenter.sh/do-not-disrupt annotations are respected.
+	ConsolidatingScaleDown featuregate.Feature = "ConsolidatingScaleDown"
+
 	// onwer: @yuanwang04
 	// kep: https://kep.k8s.io/5307
 	//
@@ -1322,6 +1330,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.30"), Default: true, PreRelease: featuregate.Beta},
 	},
 
+	ConsolidatingScaleDown: {
+		{Version: version.MustParse("1.36"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
 	ContainerRestartRules: {
 		{Version: version.MustParse("1.34"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.35"), Default: true, PreRelease: featuregate.Beta},
@@ -2407,6 +2419,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
 	ClusterTrustBundleProjection: {ClusterTrustBundle},
 
 	ContainerCheckpoint: {},
+
+	ConsolidatingScaleDown: {},
 
 	ContainerRestartRules: {},
 

@@ -24,12 +24,15 @@ import (
 	"fmt"
 	"time"
 
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/daemon"
 	"k8s.io/kubernetes/pkg/controller/deployment"
 	"k8s.io/kubernetes/pkg/controller/replicaset"
 	"k8s.io/kubernetes/pkg/controller/statefulset"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func newDaemonSetControllerDescriptor() *ControllerDescriptor {
@@ -105,10 +108,16 @@ func newReplicaSetController(ctx context.Context, controllerContext ControllerCo
 		return nil, err
 	}
 
+	var nodeInformer coreinformers.NodeInformer
+	if utilfeature.DefaultFeatureGate.Enabled(features.ConsolidatingScaleDown) {
+		nodeInformer = controllerContext.InformerFactory.Core().V1().Nodes()
+	}
+
 	rsc := replicaset.NewReplicaSetController(
 		ctx,
 		controllerContext.InformerFactory.Apps().V1().ReplicaSets(),
 		controllerContext.InformerFactory.Core().V1().Pods(),
+		nodeInformer,
 		client,
 		replicaset.BurstReplicas,
 	)

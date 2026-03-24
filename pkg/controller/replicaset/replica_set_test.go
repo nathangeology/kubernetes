@@ -51,6 +51,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/client-go/util/workqueue"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 	. "k8s.io/kubernetes/pkg/controller/testutil"
@@ -72,6 +73,7 @@ func testNewReplicaSetControllerFromClient(tb testing.TB, client clientset.Inter
 		tCtx,
 		informers.Apps().V1().ReplicaSets(),
 		informers.Core().V1().Pods(),
+		nil,
 		client,
 		burstReplicas,
 	)
@@ -637,6 +639,7 @@ func TestWatchControllers(t *testing.T) {
 		tCtx,
 		informers.Apps().V1().ReplicaSets(),
 		informers.Core().V1().Pods(),
+		nil,
 		client,
 		BurstReplicas,
 	)
@@ -1207,6 +1210,7 @@ func TestExpectationsOnRecreate(t *testing.T) {
 		tCtx,
 		f.Apps().V1().ReplicaSets(),
 		f.Core().V1().Pods(),
+		nil,
 		client,
 		100,
 	)
@@ -2127,7 +2131,10 @@ func TestGetPodsToDelete(t *testing.T) {
 		if related == nil {
 			related = test.pods
 		}
-		podsToDelete := getPodsToDelete(test.pods, related, test.diff)
+		rsc := &ReplicaSetController{
+			nodeListerSynced: func() bool { return true },
+		}
+		podsToDelete := rsc.getPodsToDelete(test.pods, related, test.diff)
 		if len(podsToDelete) != len(test.expectedPodsToDelete) {
 			t.Errorf("%s: unexpected pods to delete, expected %v, got %v", test.name, test.expectedPodsToDelete, podsToDelete)
 		}
@@ -2135,6 +2142,82 @@ func TestGetPodsToDelete(t *testing.T) {
 			t.Errorf("%s: unexpected pods to delete, expected %v, got %v", test.name, test.expectedPodsToDelete, podsToDelete)
 		}
 	}
+}
+
+func TestGetPodsToDeleteGateOffAndFallback(t *testing.T) {
+	labelMap := map[string]string{"name": "foo"}
+	rs := newReplicaSet(1, labelMap)
+
+	// Helper: create a running, ready pod on a given node.
+	makeReadyPod := func(name, nodeName string) *v1.Pod {
+		pod := newPod(name, rs, v1.PodRunning, nil, true)
+		pod.Spec.NodeName = nodeName
+		pod.Status.Conditions = []v1.PodCondition{
+			{Type: v1.PodReady, Status: v1.ConditionTrue},
+		}
+		return pod
+	}
+
+	t.Run("gate_off_uses_spreading", func(t *testing.T) {
+		// Requirements: 7.4, 7.7 — spreading heuristic is used when gate is disabled
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, false)
+
+		// node-a: 2 related pods (higher spreading rank → prefer deletion)
+		podA1 := makeReadyPod("pod-a1", "node-a")
+		podA2 := makeReadyPod("pod-a2", "node-a")
+		// node-b: 1 related pod (lower spreading rank)
+		podB1 := makeReadyPod("pod-b1", "node-b")
+
+		filteredPods := []*v1.Pod{podA1, podB1}
+		relatedPods := []*v1.Pod{podA1, podA2, podB1}
+
+		rsc := &ReplicaSetController{
+			nodeListerSynced: func() bool { return true },
+		}
+		result := rsc.getPodsToDelete(filteredPods, relatedPods, 1)
+
+		if len(result) != 1 {
+			t.Fatalf("expected 1 pod to delete, got %d", len(result))
+		}
+		// Spreading heuristic: node-a has rank 2 (2 related pods), node-b has rank 1.
+		// Higher rank = prefer deletion → pod on node-a should be selected.
+		if result[0].Spec.NodeName != "node-a" {
+			t.Errorf("expected pod on node-a to be deleted (spreading heuristic), got pod %q on %q",
+				result[0].Name, result[0].Spec.NodeName)
+		}
+	})
+
+	t.Run("gate_on_but_node_cache_not_synced_falls_back_to_spreading", func(t *testing.T) {
+		// Requirements: 7.4, 7.7 — fallback to spreading ranking when nodeListerSynced returns false
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ConsolidatingScaleDown, true)
+
+		// node-a: 2 related pods → spreading rank 2
+		podA1 := makeReadyPod("pod-a1", "node-a")
+		podA2 := makeReadyPod("pod-a2", "node-a")
+		// node-b: 1 related pod → spreading rank 1
+		podB1 := makeReadyPod("pod-b1", "node-b")
+
+		filteredPods := []*v1.Pod{podA1, podB1}
+		relatedPods := []*v1.Pod{podA1, podA2, podB1}
+
+		rsc := &ReplicaSetController{
+			nodeListerSynced: func() bool { return false }, // cache not synced
+		}
+		result := rsc.getPodsToDelete(filteredPods, relatedPods, 1)
+
+		if len(result) != 1 {
+			t.Fatalf("expected 1 pod to delete, got %d", len(result))
+		}
+		// nodeListerSynced=false → falls back to spreading ranking function
+		// (ranks by colocated related pods: node-a=2, node-b=1).
+		// However, the gate is still ON so Less() step 5 uses consolidation
+		// direction (lower rank = prefer deletion). node-b rank 1 < node-a rank 2,
+		// so pod on node-b is selected for deletion.
+		if result[0].Spec.NodeName != "node-b" {
+			t.Errorf("expected pod on node-b to be deleted (spreading ranks + consolidation sort direction), got pod %q on %q",
+				result[0].Name, result[0].Spec.NodeName)
+		}
+	})
 }
 
 func TestGetPodKeys(t *testing.T) {
@@ -2173,5 +2256,180 @@ func TestGetPodKeys(t *testing.T) {
 				t.Errorf("%s: unexpected keys for pods to delete, expected %v, got %v", test.name, test.expectedPodKeys, podKeys)
 			}
 		}
+	}
+}
+
+func TestGetPodsRankedByNodeDisruptionCost(t *testing.T) {
+	// Build a fake pod indexer with the PodNodeNameKeyIndex.
+	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		controller.PodNodeNameKeyIndex: func(obj interface{}) ([]string, error) {
+			pod, ok := obj.(*v1.Pod)
+			if !ok {
+				return []string{}, nil
+			}
+			if len(pod.Spec.NodeName) == 0 {
+				return []string{}, nil
+			}
+			return []string{pod.Spec.NodeName}, nil
+		},
+	})
+
+	labelMap := map[string]string{"name": "foo"}
+	rs := newReplicaSet(1, labelMap)
+
+	// Helper to create an active (Running, not deleted) pod on a given node.
+	makePod := func(name, nodeName string, annotations map[string]string) *v1.Pod {
+		pod := newPod(name, rs, v1.PodRunning, nil, true)
+		pod.Spec.NodeName = nodeName
+		if annotations != nil {
+			pod.Annotations = annotations
+		}
+		return pod
+	}
+
+	// --- Populate the indexer with pods on various nodes ---
+
+	// node-1: 1 active pod
+	podIndexer.Add(makePod("node1-pod0", "node-1", nil))
+
+	// node-10: 10 active pods
+	for i := 0; i < 10; i++ {
+		podIndexer.Add(makePod(fmt.Sprintf("node10-pod%d", i), "node-10", nil))
+	}
+
+	// node-100: 100 active pods
+	for i := 0; i < 100; i++ {
+		podIndexer.Add(makePod(fmt.Sprintf("node100-pod%d", i), "node-100", nil))
+	}
+
+	// node-dnd-true: 2 active pods, one with karpenter.sh/do-not-disrupt: "true"
+	podIndexer.Add(makePod("dnd-true-pod0", "node-dnd-true", map[string]string{
+		"karpenter.sh/do-not-disrupt": "true",
+	}))
+	podIndexer.Add(makePod("dnd-true-pod1", "node-dnd-true", nil))
+
+	// node-dnd-false: 2 active pods, one with karpenter.sh/do-not-disrupt: "false"
+	podIndexer.Add(makePod("dnd-false-pod0", "node-dnd-false", map[string]string{
+		"karpenter.sh/do-not-disrupt": "false",
+	}))
+	podIndexer.Add(makePod("dnd-false-pod1", "node-dnd-false", nil))
+
+	// node-dnd-capital: 2 active pods, one with karpenter.sh/do-not-disrupt: "True" (capital T)
+	podIndexer.Add(makePod("dnd-capital-pod0", "node-dnd-capital", map[string]string{
+		"karpenter.sh/do-not-disrupt": "True",
+	}))
+	podIndexer.Add(makePod("dnd-capital-pod1", "node-dnd-capital", nil))
+
+	// node-no-annotation: 2 active pods, no annotation at all
+	podIndexer.Add(makePod("no-ann-pod0", "node-no-annotation", nil))
+	podIndexer.Add(makePod("no-ann-pod1", "node-no-annotation", nil))
+
+	rsc := &ReplicaSetController{
+		podIndexer: podIndexer,
+	}
+
+	tests := []struct {
+		name          string
+		podsToRank    []*v1.Pod
+		expectedRanks []int
+		expectedDND   []bool
+	}{
+		{
+			name:          "node with 1 active pod → rank 1",
+			podsToRank:    []*v1.Pod{makePod("candidate-1", "node-1", nil)},
+			expectedRanks: []int{1},
+			expectedDND:   []bool{false},
+		},
+		{
+			name:          "node with 10 active pods → rank 10",
+			podsToRank:    []*v1.Pod{makePod("candidate-10", "node-10", nil)},
+			expectedRanks: []int{10},
+			expectedDND:   []bool{false},
+		},
+		{
+			name:          "node with 100 active pods → rank 100",
+			podsToRank:    []*v1.Pod{makePod("candidate-100", "node-100", nil)},
+			expectedRanks: []int{100},
+			expectedDND:   []bool{false},
+		},
+		{
+			name: "pod with empty node name → rank 0",
+			podsToRank: []*v1.Pod{func() *v1.Pod {
+				p := newPod("unassigned", rs, v1.PodPending, nil, true)
+				// NodeName is empty by default
+				return p
+			}()},
+			expectedRanks: []int{0},
+			expectedDND:   []bool{false},
+		},
+		{
+			name:          "do-not-disrupt annotation 'true' → DoNotDisrupt = true",
+			podsToRank:    []*v1.Pod{makePod("candidate-dnd-true", "node-dnd-true", nil)},
+			expectedRanks: []int{2},
+			expectedDND:   []bool{true},
+		},
+		{
+			name:          "do-not-disrupt annotation 'false' → DoNotDisrupt = false",
+			podsToRank:    []*v1.Pod{makePod("candidate-dnd-false", "node-dnd-false", nil)},
+			expectedRanks: []int{2},
+			expectedDND:   []bool{false},
+		},
+		{
+			name:          "do-not-disrupt annotation 'True' (capital T) → DoNotDisrupt = false (exact match only)",
+			podsToRank:    []*v1.Pod{makePod("candidate-dnd-capital", "node-dnd-capital", nil)},
+			expectedRanks: []int{2},
+			expectedDND:   []bool{false},
+		},
+		{
+			name:          "no annotation → DoNotDisrupt = false",
+			podsToRank:    []*v1.Pod{makePod("candidate-no-ann", "node-no-annotation", nil)},
+			expectedRanks: []int{2},
+			expectedDND:   []bool{false},
+		},
+		{
+			name: "multiple candidates across different nodes",
+			podsToRank: []*v1.Pod{
+				makePod("c-node1", "node-1", nil),
+				makePod("c-node10", "node-10", nil),
+				makePod("c-node100", "node-100", nil),
+				makePod("c-dnd-true", "node-dnd-true", nil),
+			},
+			expectedRanks: []int{1, 10, 100, 2},
+			expectedDND:   []bool{false, false, false, true},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := rsc.getPodsRankedByNodeDisruptionCost(tc.podsToRank)
+
+			if len(result.Rank) != len(tc.expectedRanks) {
+				t.Fatalf("expected %d ranks, got %d", len(tc.expectedRanks), len(result.Rank))
+			}
+			for i, expectedRank := range tc.expectedRanks {
+				if result.Rank[i] != expectedRank {
+					t.Errorf("rank[%d]: expected %d, got %d", i, expectedRank, result.Rank[i])
+				}
+			}
+
+			if len(result.DoNotDisrupt) != len(tc.expectedDND) {
+				t.Fatalf("expected %d DoNotDisrupt flags, got %d", len(tc.expectedDND), len(result.DoNotDisrupt))
+			}
+			for i, expectedDND := range tc.expectedDND {
+				if result.DoNotDisrupt[i] != expectedDND {
+					t.Errorf("DoNotDisrupt[%d]: expected %v, got %v", i, expectedDND, result.DoNotDisrupt[i])
+				}
+			}
+
+			// Verify the returned pods are the same as the input pods.
+			if len(result.Pods) != len(tc.podsToRank) {
+				t.Fatalf("expected %d pods, got %d", len(tc.podsToRank), len(result.Pods))
+			}
+			for i, pod := range tc.podsToRank {
+				if result.Pods[i].Name != pod.Name {
+					t.Errorf("Pods[%d]: expected %s, got %s", i, pod.Name, result.Pods[i].Name)
+				}
+			}
+		})
 	}
 }

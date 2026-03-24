@@ -55,7 +55,7 @@ func NewReplicationManager(ctx context.Context, podInformer coreinformers.PodInf
 	logger := klog.FromContext(ctx)
 	eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
 	return &ReplicationManager{
-		*replicaset.NewBaseController(logger, informerAdapter{rcInformer}, podInformer, clientsetAdapter{kubeClient}, burstReplicas,
+		*replicaset.NewBaseController(logger, informerAdapter{rcInformer}, podInformer, nil, clientsetAdapter{kubeClient}, burstReplicas,
 			v1.SchemeGroupVersion.WithKind("ReplicationController"),
 			"replication_controller",
 			"replicationmanager",
